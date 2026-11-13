@@ -1,0 +1,39 @@
+{
+  "LOG": true,
+  "LOG_LEVEL": "info",
+  "API_TIMEOUT_MS": 600000,
+  "HOST": "127.0.0.1",
+  "PORT": 3457,
+  "APIKEY": "",
+  "CUSTOM_ROUTER_PATH": "{{DIR}}/router.js",
+  "transformers": [
+    {
+      "path": "{{DIR}}/codex.js",
+      "options": { "authFile": "~/.codex-gpt/auth.json", "defaultEffort": "medium" }
+    },
+    { "path": "{{DIR}}/stripreasoning.js" }
+  ],
+  "Providers": [
+    {
+      "name": "codex",
+      "api_base_url": "https://chatgpt.com/backend-api/codex/responses",
+      "api_key": "subscription-oauth",
+      "models": ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+      "transformer": { "use": ["codex"] }
+    },
+    {
+      "name": "openai",
+      "api_base_url": "https://api.openai.com/v1/chat/completions",
+      "api_key": "$OPENAI_API_KEY",
+      "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+      "transformer": { "use": ["maxcompletiontokens", "stripreasoning"] }
+    }
+  ],
+  "Router": {
+    "default": "codex,gpt-6-astra",
+    "background": "codex,gpt-6-luna",
+    "think": "codex,gpt-6-astra",
+    "longContext": "codex,gpt-6-astra",
+    "longContextThreshold": 200000
+  }
+}

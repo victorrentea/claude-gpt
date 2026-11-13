@@ -1,0 +1,13 @@
+{
+  "name": "claude-gpt",
+  "version": "1.0.0",
+  "description": "Claude Code CLI running on OpenAI Codex models through a ChatGPT subscription (no API credit)",
+  "scripts": {},
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@musistudio/claude-code-router": "^2.0.0"
+  },
+  "private": true
+}

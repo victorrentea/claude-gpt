@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# codex-gpt — Claude Code CLI peste modelele Codex, pe ABONAMENTUL ChatGPT (nu pe credit API).
+#
+#   codex-gpt [argumente claude]   pornește routerul (dacă trebuie) și lansează `claude` prin el
+#   codex-gpt login                sesiune OAuth proprie (~/.codex-gpt/auth.json), separată de `codex`
+#   codex-gpt status|restart|stop  routerul CCR al lui codex-gpt (port 3457)
+#   codex-gpt models               modelele Codex disponibile pe abonament
+#   codex-gpt ping [model]         o cerere de probă prin router, fără să pornească claude
+#   codex-gpt logs                 coada logului de router
+#
+# Izolare: CCR își ține starea în $HOME/.claude-code-router, pe care o folosește și claude-local
+# (port 3456). Aici CCR rulează cu HOME=~/.codex-gpt/ccr-home și pe portul 3457, deci cele două
+# merg simultan. `claude` însuși pornește cu HOME-ul real (login, setări, sesiuni neatinse).
+set -euo pipefail
+
+# folderul repo-ului, oricare ar fi (lansatorul e chemat de obicei prin symlink din ~/.local/bin)
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+STATE="$HOME/.codex-gpt"
+CCR_HOME="$STATE/ccr-home"
+CCR_JS="$DIR/node_modules/@musistudio/claude-code-router/dist/cli.js"
+PORT=3457
+URL="http://127.0.0.1:$PORT"
+LOG="$STATE/router.log"
+STAMP="$STATE/router.started"
+
+mkdir -p "$CCR_HOME/.claude-code-router"
+chmod 700 "$STATE"
+# config.json = config.template.json cu calea repo-ului; rescris doar când diferă (altfel mtime-ul
+# nou ar reporni routerul degeaba)
+CFG_NEW="$(sed "s#{{DIR}}#$DIR#g" "$DIR/config.template.json")"
+[[ -f "$DIR/config.json" && "$(cat "$DIR/config.json")" == "$CFG_NEW" ]] || printf '%s\n' "$CFG_NEW" > "$DIR/config.json"
+ln -sfn "$DIR/config.json" "$CCR_HOME/.claude-code-router/config.json"
+
+[[ -f "$CCR_JS" ]] || { echo "codex-gpt: lipsește CCR. Rulează: cd $DIR && npm install" >&2; exit 1; }
+
+ccr() { HOME="$CCR_HOME" node "$CCR_JS" "$@"; }
+
+up() { curl -s -o /dev/null -m 2 "$URL/" 2>/dev/null; }
+
+stop_router() { ccr stop >/dev/null 2>&1 || true; rm -f "$STAMP"; }
+
+start_router() {
+  CODEX_GPT_REAL_HOME="$HOME" HOME="$CCR_HOME" nohup node "$CCR_JS" start >>"$LOG" 2>&1 </dev/null &
+  for _ in $(seq 1 50); do up && { touch "$STAMP"; return 0; }; sleep 0.2; done
+  echo "codex-gpt: routerul n-a pornit pe $PORT. Vezi: $LOG" >&2
+  tail -20 "$LOG" >&2
+  exit 1
+}
+
+# repornește routerul dacă s-a schimbat configul, routerul sau transformerul de când a pornit
+ensure_router() {
+  if up; then
+    local f
+    for f in "$DIR/config.json" "$DIR/router.js" "$DIR/codex.js" "$DIR/stripreasoning.js"; do
+      if [[ ! -f "$STAMP" || "$f" -nt "$STAMP" ]]; then stop_router; sleep 0.5; break; fi
+    done
+  fi
+  up || start_router
+}
+
+auth_file() { [[ -f "$STATE/auth.json" ]] && echo "$STATE/auth.json" || echo "$HOME/.codex/auth.json"; }
+
+case "${1:-}" in
+  login)
+    shift
+    echo "Login ChatGPT pentru codex-gpt (sesiune separată de cea a lui codex, în $STATE)…"
+    # forțat în fișier: transformerul citește auth.json, nu Keychain-ul
+    CODEX_HOME="$STATE" codex login -c cli_auth_credentials_store='"file"' "$@"
+    chmod 600 "$STATE/auth.json" 2>/dev/null || true
+    exit 0 ;;
+  status)
+    if up; then echo "router: pornit pe $URL"; else echo "router: oprit"; fi
+    echo "auth:   $(auth_file)$([[ -f "$STATE/auth.json" ]] || echo '  (împrumutat de la codex, read-only — rulează `codex-gpt login`)')"
+    exit 0 ;;
+  restart) stop_router; sleep 0.5; start_router; echo "router: repornit pe $URL"; exit 0 ;;
+  stop) stop_router; echo "router: oprit"; exit 0 ;;
+  logs) tail -n "${2:-60}" "$LOG"; ls -t "$CCR_HOME/.claude-code-router/logs/"*.log 2>/dev/null | head -1 | xargs -I{} tail -n "${2:-60}" {}; exit 0 ;;
+  models)
+    AUTH="$(auth_file)" python3 - <<'PY'
+import json, os, urllib.request
+t = json.load(open(os.environ["AUTH"]))["tokens"]
+r = urllib.request.Request("https://chatgpt.com/backend-api/codex/models?client_version=0.164.0",
+    headers={"Authorization": "Bearer " + t["access_token"], "chatgpt-account-id": t["account_id"], "originator": "codex_cli_rs"})
+for m in json.load(urllib.request.urlopen(r, timeout=30)).get("models", []):
+    if m.get("visibility") == "list":
+        print(f'{m["slug"]:16} ctx {m.get("context_window")}')
+PY
+    exit 0 ;;
+  ping)
+    ensure_router
+    curl -sS -m 120 "$URL/v1/messages" -H 'content-type: application/json' -H 'x-api-key: test' \
+      -d "{\"model\":\"${2:-claude-opus-4-5}\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: PONG\"}]}"
+    echo; exit 0 ;;
+esac
+
+ensure_router
+
+# același env pe care îl pune `ccr code`, dar spre routerul nostru
+export ANTHROPIC_BASE_URL="$URL"
+export ANTHROPIC_AUTH_TOKEN="codex-gpt"
+export NO_PROXY="127.0.0.1"
+export DISABLE_TELEMETRY=true
+export DISABLE_COST_WARNINGS=true
+export API_TIMEOUT_MS=600000
+unset ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+# Opus 5.5 are 1M, dar gpt-6-astra/luna au 272k (sol/terra 500k): fără limita asta Claude Code
+# n-ar compacta la timp și backend-ul ar refuza conversația. Luăm minimul comun.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CODEX_GPT_CONTEXT:-272000}"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+# Header-ul și statusline-ul arată modelul real: aliasurile Opus/Sonnet/Haiku din /model pointează pe
+# ID-urile Codex. Capabilities: effort (low..max) și mesaje system la mijloc (codex.js le ține la loc).
+CAPS="effort,max_effort,mid_conversation_system"
+export ANTHROPIC_MODEL="${CODEX_GPT_DEFAULT:-opus}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-6-astra
+export ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="GPT-6 Astra"
+export ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION="Codex pe abonament · frontier, munca grea"
+export ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES="$CAPS"
+export ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-6.1-sol
+export ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="GPT-6.1 Sol"
+export ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION="Codex pe abonament · workhorse pentru cod, 500k"
+export ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES="$CAPS"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-6-luna
+export ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="GPT-6 Luna"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION="Codex pe abonament · rapid, task-uri de fundal"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES="$CAPS"
+export ANTHROPIC_DEFAULT_FABLE_MODEL=gpt-6.1-terra
+export ANTHROPIC_DEFAULT_FABLE_MODEL_NAME="GPT-6.1 Terra"
+export ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION="Codex pe abonament · echilibrat, 500k"
+export ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES="$CAPS"
+export ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna
+# „Default (recommended)” din /model: altfel ia default-ul contului (opus[1m]) și afișează gpt-6-astra[1m]
+export ANTHROPIC_DEFAULT_MODEL=gpt-6-astra
+
+# același flag ca aliasul `claude` din zsh (doar permite modul bypass, nu-l pornește)
+exec claude --allow-dangerously-skip-permissions "$@"
